@@ -6,6 +6,10 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		C10E6C992F2AEF860095D7EC /* SwiftSoup in Frameworks */ = {isa = PBXBuildFile; productRef = C10E6C982F2AEF860095D7EC /* SwiftSoup */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXContainerItemProxy section */
 		C10E6C672F2AED440095D7EC /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
@@ -52,6 +56,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				C10E6C992F2AEF860095D7EC /* SwiftSoup in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -112,6 +117,7 @@
 			);
 			name = aiomedia;
 			packageProductDependencies = (
+				C10E6C982F2AEF860095D7EC /* SwiftSoup */,
 			);
 			productName = aiomedia;
 			productReference = C10E6C592F2AED430095D7EC /* aiomedia.app */;
@@ -195,6 +201,9 @@
 			);
 			mainGroup = C10E6C502F2AED430095D7EC;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				C10E6C972F2AEF860095D7EC /* XCRemoteSwiftPackageReference "SwiftSoup" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = C10E6C5A2F2AED430095D7EC /* Products */;
 			projectDirPath = "";
@@ -615,6 +624,25 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		C10E6C972F2AEF860095D7EC /* XCRemoteSwiftPackageReference "SwiftSoup" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/scinfu/SwiftSoup.git";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 2.11.3;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		C10E6C982F2AEF860095D7EC /* SwiftSoup */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = C10E6C972F2AEF860095D7EC /* XCRemoteSwiftPackageReference "SwiftSoup" */;
+			productName = SwiftSoup;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = C10E6C512F2AED430095D7EC /* Project object */;
 }
