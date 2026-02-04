@@ -389,7 +389,11 @@ class SoulseekClient: ObservableObject {
             return
         }
         
-        let token = UInt32.random(in: 1...UInt32.max)
+        // Generate unique token
+        var token: UInt32
+        repeat {
+            token = UInt32.random(in: 1...UInt32.max)
+        } while activeSearchTokens.contains(token)
         activeSearchTokens.insert(token)
         
         switch searchType {
@@ -546,7 +550,8 @@ class SoulseekClient: ObservableObject {
         // Only skip outbound if user explicitly chose passive mode
         if searchType == .passive {
             log("📵 Passive mode: Skipping outbound to \(username)", type: .info)
-            return  // Don't send CannotConnect, just ignore
+            sendCannotConnect(token: token, username: username)
+            return
         }
         
         // Initiate connection to peer
