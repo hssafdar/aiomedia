@@ -9,6 +9,9 @@ enum SoulseekSearchType: String, CaseIterable, Identifiable {
     case wishlist = "Wishlist (Code 103)"
     case room = "Room (Code 120)"
     case user = "User (Code 42)"
+    case similarUsers = "Similar Users (Code 110)"
+    case recommendations = "Recommendations (Code 54)"
+    case globalRecs = "Global Recs (Code 56)"
     
     var id: String { rawValue }
 }
@@ -157,15 +160,33 @@ class SoulseekClient: ObservableObject {
     private func readPeerPacket(_ connection: NWConnection) {
         // Read 4-byte Length
         connection.receive(minimumIncompleteLength: 4, maximumLength: 4) { [weak self] data, _, _, error in
-            guard let self = self, let data = data, data.count == 4 else {
-                connection.cancel(); return
+            guard let self = self else { return }
+            
+            if let error = error {
+                self.log("⚠️ Peer receive error: \(error.localizedDescription)", type: .error)
+                connection.cancel()
+                return
+            }
+            
+            guard let data = data, data.count == 4 else {
+                self.log("⚠️ Peer connection closed or invalid length header", type: .error)
+                connection.cancel()
+                return
             }
             
             let len = data.withUnsafeBytes { $0.load(as: UInt32.self) }
+            self.log("📥 Peer packet incoming: \(len) bytes", type: .traffic)
             
             // Read Body
-            connection.receive(minimumIncompleteLength: Int(len), maximumLength: Int(len)) { body, _, _, _ in
+            connection.receive(minimumIncompleteLength: Int(len), maximumLength: Int(len)) { body, _, _, error in
+                if let error = error {
+                    self.log("⚠️ Peer body receive error: \(error.localizedDescription)", type: .error)
+                    connection.cancel()
+                    return
+                }
+                
                 if let body = body {
+                    self.log("📥 Received \(body.count) bytes from peer", type: .traffic)
                     self.processPeerMessage(body)
                 }
                 // Keep connection open for more packets
@@ -175,28 +196,40 @@ class SoulseekClient: ObservableObject {
     }
     
     private func processPeerMessage(_ data: Data) {
-        guard data.count >= 4 else { return }
+        guard data.count >= 4 else { 
+            log("⚠️ Peer message too short: \(data.count) bytes", type: .error)
+            return 
+        }
         
         // Code is first 4 bytes
         let code = data.prefix(4).withUnsafeBytes { $0.load(as: UInt32.self) }
         var content = data.dropFirst(4)
         
-        log("📨 Peer message code: \(code)", type: .traffic)
+        log("📨 Peer message code: \(code), size: \(data.count) bytes", type: .traffic)
         
         switch code {
         case 1: // Peer Init
+            log("🤝 Received PeerInit response", type: .info)
             break
             
         case 9: // Share Reply (Search Results)
+            log("📦 Received ShareReply (code 9), attempting to parse...", type: .info)
             // Try decompression first (Zlib)
             if let decompressed = try? decompress(content) {
+                log("✅ Decompressed \(content.count) -> \(decompressed.count) bytes", type: .success)
                 parseShareReply(decompressed)
             } else {
+                log("⚠️ Decompression failed, trying raw parse", type: .info)
                 // Try parsing raw
                 parseShareReply(content)
             }
             
         default:
+            log("❓ Unknown peer message code: \(code)", type: .info)
+            // Hex dump first 32 bytes for debugging
+            let dumpSize = min(32, data.count)
+            let hexDump = data.prefix(dumpSize).map { String(format: "%02x", $0) }.joined(separator: " ")
+            log("📋 Hex dump: \(hexDump)", type: .traffic)
             break
         }
     }
@@ -243,7 +276,10 @@ class SoulseekClient: ObservableObject {
         var offset = 0
         
         func readBytes(_ count: Int) -> Data? {
-            guard offset + count <= data.count else { return nil }
+            guard offset + count <= data.count else { 
+                log("⚠️ Parse error: tried to read \(count) bytes at offset \(offset), but data is only \(data.count) bytes", type: .error)
+                return nil 
+            }
             let d = data.subdata(in: offset..<offset+count)
             offset += count
             return d
@@ -261,21 +297,47 @@ class SoulseekClient: ObservableObject {
         }
         
         // Protocol: [User] [Token] [Count] [ [File]... ]
-        guard let username = readString() else { return }
-        guard let token = readUInt32() else { return }
-        guard let count = readUInt32() else { return }
+        guard let username = readString() else { 
+            log("⚠️ Failed to read username from ShareReply", type: .error)
+            return 
+        }
+        guard let token = readUInt32() else { 
+            log("⚠️ Failed to read token from ShareReply", type: .error)
+            return 
+        }
+        guard let count = readUInt32() else { 
+            log("⚠️ Failed to read count from ShareReply", type: .error)
+            return 
+        }
+        
+        log("📦 Parsing ShareReply from \(username): token=\(token), count=\(count)", type: .info)
         
         // Remove token from active searches once we receive results
         activeSearchTokens.remove(token)
         
         var results: [SearchResult] = []
         
-        for _ in 0..<count {
-            guard let _ = readBytes(1) else { break } // Code
-            guard let filename = readString() else { break }
-            guard let size = readUInt32() else { break }
-            guard let ext = readString() else { break }
-            guard let attrCount = readUInt32() else { break }
+        for i in 0..<count {
+            guard let _ = readBytes(1) else { 
+                log("⚠️ Failed to read code for file \(i+1)", type: .error)
+                break 
+            } // Code
+            guard let filename = readString() else { 
+                log("⚠️ Failed to read filename for file \(i+1)", type: .error)
+                break 
+            }
+            guard let size = readUInt32() else { 
+                log("⚠️ Failed to read size for file \(i+1)", type: .error)
+                break 
+            }
+            guard let ext = readString() else { 
+                log("⚠️ Failed to read extension for file \(i+1)", type: .error)
+                break 
+            }
+            guard let attrCount = readUInt32() else { 
+                log("⚠️ Failed to read attr count for file \(i+1)", type: .error)
+                break 
+            }
             
             for _ in 0..<attrCount {
                 guard let _ = readUInt32() else { break }
@@ -302,6 +364,8 @@ class SoulseekClient: ObservableObject {
         if !results.isEmpty {
             log("⚡ Found \(results.count) files from \(username)", type: .success)
             searchResultsSubject.send(results)
+        } else {
+            log("⚠️ No results extracted from ShareReply", type: .info)
         }
     }
     
@@ -326,6 +390,12 @@ class SoulseekClient: ObservableObject {
             searchRoom(query: query, room: targetRoom, token: token)
         case .user:
             searchUser(query: query, username: targetUser, token: token)
+        case .similarUsers:
+            searchSimilarUsers(query: query, token: token)
+        case .recommendations:
+            searchRecommendations(query: query, token: token)
+        case .globalRecs:
+            searchGlobalRecommendations(query: query, token: token)
         }
     }
     
@@ -394,6 +464,45 @@ class SoulseekClient: ObservableObject {
         send(packet: packet)
     }
     
+    private func searchSimilarUsers(query: String, token: UInt32) {
+        log("🔎 Searching Similar Users: \(query)", type: .traffic)
+        
+        var packet = Data()
+        packet.append(contentsOf: UInt32(0).littleEndianBytes)
+        packet.append(contentsOf: UInt32(110).littleEndianBytes) // Similar Users Search
+        packet.append(contentsOf: token.littleEndianBytes)
+        packet.append(contentsOf: UInt32(query.count).littleEndianBytes)
+        packet.append(query.data(using: .utf8) ?? Data())
+        
+        send(packet: packet)
+    }
+    
+    private func searchRecommendations(query: String, token: UInt32) {
+        log("🔎 Searching Recommendations: \(query)", type: .traffic)
+        
+        var packet = Data()
+        packet.append(contentsOf: UInt32(0).littleEndianBytes)
+        packet.append(contentsOf: UInt32(54).littleEndianBytes) // Recommendations
+        packet.append(contentsOf: token.littleEndianBytes)
+        packet.append(contentsOf: UInt32(query.count).littleEndianBytes)
+        packet.append(query.data(using: .utf8) ?? Data())
+        
+        send(packet: packet)
+    }
+    
+    private func searchGlobalRecommendations(query: String, token: UInt32) {
+        log("🔎 Searching Global Recommendations: \(query)", type: .traffic)
+        
+        var packet = Data()
+        packet.append(contentsOf: UInt32(0).littleEndianBytes)
+        packet.append(contentsOf: UInt32(56).littleEndianBytes) // Global Recommendations
+        packet.append(contentsOf: token.littleEndianBytes)
+        packet.append(contentsOf: UInt32(query.count).littleEndianBytes)
+        packet.append(query.data(using: .utf8) ?? Data())
+        
+        send(packet: packet)
+    }
+    
     private func performLogin(user: String, pass: String) {
         log("🔑 Authenticating...", type: .info)
         var packet = Data()
@@ -433,6 +542,36 @@ class SoulseekClient: ObservableObject {
         packet.append(contentsOf: UInt32(35).littleEndianBytes)
         packet.append(contentsOf: UInt32(0).littleEndianBytes)
         packet.append(contentsOf: UInt32(0).littleEndianBytes)
+        send(packet: packet)
+    }
+    
+    private func sendHaveNoParent() {
+        log("📡 Sending HaveNoParent", type: .info)
+        var packet = Data()
+        packet.append(contentsOf: UInt32(0).littleEndianBytes)
+        packet.append(contentsOf: UInt32(71).littleEndianBytes)
+        packet.append(UInt8(1)) // true - we have no parent
+        send(packet: packet)
+    }
+    
+    private func sendCannotConnect(token: UInt32, username: String) {
+        log("❌ Sending CannotConnect for \(username) (token: \(token))", type: .info)
+        var packet = Data()
+        packet.append(contentsOf: UInt32(0).littleEndianBytes)
+        packet.append(contentsOf: UInt32(1001).littleEndianBytes)
+        packet.append(contentsOf: token.littleEndianBytes)
+        packet.append(contentsOf: UInt32(username.count).littleEndianBytes)
+        packet.append(username.data(using: .utf8) ?? Data())
+        send(packet: packet)
+    }
+    
+    private func requestPeerAddress(username: String) {
+        log("📍 Requesting peer address for \(username)", type: .info)
+        var packet = Data()
+        packet.append(contentsOf: UInt32(0).littleEndianBytes)
+        packet.append(contentsOf: UInt32(3).littleEndianBytes) // GetPeerAddress
+        packet.append(contentsOf: UInt32(username.count).littleEndianBytes)
+        packet.append(username.data(using: .utf8) ?? Data())
         send(packet: packet)
     }
     
@@ -482,24 +621,81 @@ class SoulseekClient: ObservableObject {
     }
     
     private func connectToPeer(ip: String, port: UInt32, username: String, token: UInt32, connType: String) {
+        log("🔗 Attempting peer connection to \(username) at \(ip):\(port) (type: '\(connType)', token: \(token))", type: .info)
+        
         let params = NWParameters.tcp
+        params.includePeerToPeer = true
+        
+        // Set connection timeout
+        let tcpOptions = NWProtocolTCP.Options()
+        tcpOptions.connectionTimeout = 30 // 30 seconds timeout
+        params.defaultProtocolStack.transportProtocol = tcpOptions
+        
         let host = NWEndpoint.Host(ip)
         let portEndpoint = NWEndpoint.Port(rawValue: UInt16(port)) ?? NWEndpoint.Port(integerLiteral: UInt16(port))
         
         let peerConnection = NWConnection(host: host, port: portEndpoint, using: params)
         
+        // Create a timeout timer
+        var connectionTimer: DispatchWorkItem? = nil
+        
         peerConnection.stateUpdateHandler = { [weak self] state in
+            guard let self = self else { return }
+            
             switch state {
+            case .preparing:
+                self.log("🔄 Preparing connection to \(username)...", type: .info)
+                
+                // Set a timeout for the connection
+                connectionTimer = DispatchWorkItem { [weak self, weak peerConnection] in
+                    self?.log("⏱️ Connection timeout for \(username)", type: .error)
+                    peerConnection?.cancel()
+                    self?.sendCannotConnect(token: token, username: username)
+                    self?.requestPeerAddress(username: username)
+                }
+                DispatchQueue.global().asyncAfter(deadline: .now() + 30, execute: connectionTimer!)
+                
             case .ready:
-                self?.log("✅ Connected to peer \(username)", type: .success)
-                self?.sendPierceFirewall(connection: peerConnection, token: token)
+                // Cancel the timeout timer
+                connectionTimer?.cancel()
+                connectionTimer = nil
+                
+                self.log("✅ Connected to peer \(username) - sending init for type '\(connType)'", type: .success)
+                
+                // Determine which initialization message to send based on connection type
+                // Connection type 'P' (0x50 / 80 decimal) requires PeerInit
+                // Connection type 'F' (0x46 / 70 decimal) requires PierceFirewall
+                // Connection type 'D' (0x44 / 68 decimal) is for distributed network
+                
+                if connType == "P" {
+                    // Send PeerInit for type 'P' connections
+                    self.sendPeerInit(connection: peerConnection, username: username, connType: connType, token: token)
+                } else {
+                    // Send PierceFirewall for other types (F, D)
+                    self.sendPierceFirewall(connection: peerConnection, token: token)
+                }
+                
                 // Start reading from this peer connection
-                self?.readPeerPacket(peerConnection)
+                self.readPeerPacket(peerConnection)
+                
             case .failed(let error):
-                self?.log("❌ Failed to connect to peer \(username): \(error)", type: .error)
+                connectionTimer?.cancel()
+                connectionTimer = nil
+                self.log("❌ Failed to connect to peer \(username): \(error.localizedDescription)", type: .error)
                 peerConnection.cancel()
+                // Notify server we couldn't connect
+                self.sendCannotConnect(token: token, username: username)
+                // Try to get peer address from server as fallback
+                self.requestPeerAddress(username: username)
+                
             case .waiting(let error):
-                self?.log("⏳ Waiting to connect to peer \(username): \(error)", type: .info)
+                self.log("⏳ Waiting to connect to peer \(username): \(error.localizedDescription)", type: .info)
+                
+            case .cancelled:
+                connectionTimer?.cancel()
+                connectionTimer = nil
+                self.log("🚫 Connection to \(username) cancelled", type: .info)
+                
             default:
                 break
             }
@@ -523,6 +719,37 @@ class SoulseekClient: ObservableObject {
         connection.send(content: packet, completion: .contentProcessed { error in
             if let error = error {
                 self.log("⚠️ PierceFirewall send error: \(error)", type: .error)
+            }
+        })
+    }
+    
+    private func sendPeerInit(connection: NWConnection, username: String, connType: String, token: UInt32) {
+        log("🤝 Sending PeerInit for type '\(connType)' with token \(token)", type: .traffic)
+        
+        var packet = Data()
+        // Length placeholder
+        packet.append(contentsOf: UInt32(0).littleEndianBytes)
+        // Code 1 = PeerInit
+        packet.append(UInt8(1))
+        // Our username
+        let myUsername = UserDefaults.standard.string(forKey: "slsk_user") ?? ""
+        packet.append(contentsOf: UInt32(myUsername.count).littleEndianBytes)
+        packet.append(myUsername.data(using: .utf8) ?? Data())
+        // Connection type
+        packet.append(contentsOf: UInt32(connType.count).littleEndianBytes)
+        packet.append(connType.data(using: .utf8) ?? Data())
+        // Token
+        packet.append(contentsOf: token.littleEndianBytes)
+        
+        // Fix length
+        let len = UInt32(packet.count - 4)
+        packet.replaceSubrange(0..<4, with: len.littleEndianBytes)
+        
+        connection.send(content: packet, completion: .contentProcessed { error in
+            if let error = error {
+                self.log("⚠️ PeerInit send error: \(error)", type: .error)
+            } else {
+                self.log("✅ PeerInit sent successfully", type: .success)
             }
         })
     }
@@ -562,6 +789,7 @@ class SoulseekClient: ObservableObject {
                     self.sendSetListenPort()
                     self.sendSetStatus()
                     self.sendSetSharedCounts()
+                    self.sendHaveNoParent()
                 } else {
                     self.loginError = "Login Rejected"
                     self.log("⛔ Login Failed", type: .error)
@@ -569,6 +797,20 @@ class SoulseekClient: ObservableObject {
                 
             case 18: // ConnectToPeer
                 self.handleConnectToPeer(data)
+            
+            case 9: // FileSearchResult (relayed through server)
+                self.log("📦 Received FileSearchResult from server", type: .info)
+                // Skip the code (4 bytes) and parse the embedded peer message
+                let peerData = data.dropFirst(4)
+                if peerData.count >= 4 {
+                    // Try decompression first (Zlib)
+                    if let decompressed = try? self.decompress(peerData) {
+                        self.parseShareReply(decompressed)
+                    } else {
+                        // Try parsing raw
+                        self.parseShareReply(peerData)
+                    }
+                }
                 
             case 93: // Embedded distributed message
                 self.log("📦 Received embedded message", type: .info)
