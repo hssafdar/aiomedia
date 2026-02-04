@@ -265,6 +265,9 @@ class SoulseekClient: ObservableObject {
         guard let token = readUInt32() else { return }
         guard let count = readUInt32() else { return }
         
+        // Remove token from active searches once we receive results
+        activeSearchTokens.remove(token)
+        
         var results: [SearchResult] = []
         
         for _ in 0..<count {
@@ -307,7 +310,11 @@ class SoulseekClient: ObservableObject {
     func search(query: String) {
         guard isLoggedIn else { return }
         
-        let token = UInt32.random(in: 1...99999)
+        // Generate unique token
+        var token: UInt32
+        repeat {
+            token = UInt32.random(in: 1...99999)
+        } while activeSearchTokens.contains(token)
         activeSearchTokens.insert(token)
         
         switch searchType {
@@ -338,6 +345,8 @@ class SoulseekClient: ObservableObject {
     private func searchWishlist(query: String, token: UInt32) {
         log("🔎 Adding Wishlist Search: \(query)", type: .traffic)
         
+        // Note: Wishlist searches don't use tokens in the protocol packet,
+        // but we track the token for consistency
         var packet = Data()
         packet.append(contentsOf: UInt32(0).littleEndianBytes)
         packet.append(contentsOf: UInt32(103).littleEndianBytes) // Add Wishlist Item
@@ -461,10 +470,10 @@ class SoulseekClient: ObservableObject {
         
         // Convert IP from little-endian integer to dotted notation
         let ipString = String(format: "%d.%d.%d.%d",
-                             (ip >> 24) & 0xFF,
-                             (ip >> 16) & 0xFF,
+                             ip & 0xFF,
                              (ip >> 8) & 0xFF,
-                             ip & 0xFF)
+                             (ip >> 16) & 0xFF,
+                             (ip >> 24) & 0xFF)
         
         log("🔗 Server requests peer connection to \(username) at \(ipString):\(port) (type: \(connType), token: \(token))", type: .info)
         
@@ -504,7 +513,7 @@ class SoulseekClient: ObservableObject {
         
         var packet = Data()
         packet.append(contentsOf: UInt32(0).littleEndianBytes) // Placeholder for length
-        packet.append(contentsOf: UInt32(0).littleEndianBytes) // PierceFirewall code
+        packet.append(contentsOf: UInt32(0).littleEndianBytes) // PierceFirewall code (0)
         packet.append(contentsOf: token.littleEndianBytes)
         
         // Update length
