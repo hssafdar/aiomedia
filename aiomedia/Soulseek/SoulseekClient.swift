@@ -4,6 +4,15 @@ import Combine
 import CryptoKit
 import Compression
 
+enum SoulseekSearchType: String, CaseIterable, Identifiable {
+    case network = "Network (Code 26)"
+    case wishlist = "Wishlist (Code 103)"
+    case room = "Room (Code 120)"
+    case user = "User (Code 42)"
+    
+    var id: String { rawValue }
+}
+
 class SoulseekClient: ObservableObject {
     static let shared = SoulseekClient()
     
@@ -20,6 +29,12 @@ class SoulseekClient: ObservableObject {
     @Published var isLoggedIn: Bool = false
     @Published var loginError: String? = nil
     @Published var logs: [ConsoleLog] = []
+    
+    // Search configuration
+    @Published var searchType: SoulseekSearchType = .network
+    @Published var targetUser: String = ""
+    @Published var targetRoom: String = ""
+    private var activeSearchTokens: Set<UInt32> = []
     
     // Results Stream
     let searchResultsSubject = PassthroughSubject<[SearchResult], Never>()
@@ -134,6 +149,7 @@ class SoulseekClient: ObservableObject {
     // MARK: - 2. Peer Handling (The Results Engine)
     
     private func handlePeerConnection(_ connection: NWConnection) {
+        log("🤝 Incoming peer connection", type: .info)
         connection.start(queue: queue)
         readPeerPacket(connection)
     }
@@ -164,6 +180,8 @@ class SoulseekClient: ObservableObject {
         // Code is first 4 bytes
         let code = data.prefix(4).withUnsafeBytes { $0.load(as: UInt32.self) }
         var content = data.dropFirst(4)
+        
+        log("📨 Peer message code: \(code)", type: .traffic)
         
         switch code {
         case 1: // Peer Init
@@ -247,6 +265,9 @@ class SoulseekClient: ObservableObject {
         guard let token = readUInt32() else { return }
         guard let count = readUInt32() else { return }
         
+        // Remove token from active searches once we receive results
+        activeSearchTokens.remove(token)
+        
         var results: [SearchResult] = []
         
         for _ in 0..<count {
@@ -288,12 +309,85 @@ class SoulseekClient: ObservableObject {
     
     func search(query: String) {
         guard isLoggedIn else { return }
-        log("🔎 Broadcasting: \(query)", type: .traffic)
+        
+        // Generate unique token
+        var token: UInt32
+        repeat {
+            token = UInt32.random(in: 1...99999)
+        } while activeSearchTokens.contains(token)
+        activeSearchTokens.insert(token)
+        
+        switch searchType {
+        case .network:
+            searchNetwork(query: query, token: token)
+        case .wishlist:
+            searchWishlist(query: query, token: token)
+        case .room:
+            searchRoom(query: query, room: targetRoom, token: token)
+        case .user:
+            searchUser(query: query, username: targetUser, token: token)
+        }
+    }
+    
+    private func searchNetwork(query: String, token: UInt32) {
+        log("🔎 Broadcasting (Network): \(query)", type: .traffic)
         
         var packet = Data()
         packet.append(contentsOf: UInt32(0).littleEndianBytes)
         packet.append(contentsOf: UInt32(26).littleEndianBytes) // File Search
-        packet.append(contentsOf: UInt32.random(in: 1...99999).littleEndianBytes)
+        packet.append(contentsOf: token.littleEndianBytes)
+        packet.append(contentsOf: UInt32(query.count).littleEndianBytes)
+        packet.append(query.data(using: .utf8) ?? Data())
+        
+        send(packet: packet)
+    }
+    
+    private func searchWishlist(query: String, token: UInt32) {
+        log("🔎 Adding Wishlist Search: \(query)", type: .traffic)
+        
+        // Note: Wishlist searches don't use tokens in the protocol packet,
+        // but we track the token for consistency
+        var packet = Data()
+        packet.append(contentsOf: UInt32(0).littleEndianBytes)
+        packet.append(contentsOf: UInt32(103).littleEndianBytes) // Add Wishlist Item
+        packet.append(contentsOf: UInt32(query.count).littleEndianBytes)
+        packet.append(query.data(using: .utf8) ?? Data())
+        
+        send(packet: packet)
+    }
+    
+    private func searchRoom(query: String, room: String, token: UInt32) {
+        guard !room.isEmpty else {
+            log("⚠️ Room search requires a room name", type: .error)
+            return
+        }
+        log("🔎 Searching Room '\(room)': \(query)", type: .traffic)
+        
+        var packet = Data()
+        packet.append(contentsOf: UInt32(0).littleEndianBytes)
+        packet.append(contentsOf: UInt32(120).littleEndianBytes) // Room Search
+        packet.append(contentsOf: UInt32(room.count).littleEndianBytes)
+        packet.append(room.data(using: .utf8) ?? Data())
+        packet.append(contentsOf: token.littleEndianBytes)
+        packet.append(contentsOf: UInt32(query.count).littleEndianBytes)
+        packet.append(query.data(using: .utf8) ?? Data())
+        
+        send(packet: packet)
+    }
+    
+    private func searchUser(query: String, username: String, token: UInt32) {
+        guard !username.isEmpty else {
+            log("⚠️ User search requires a username", type: .error)
+            return
+        }
+        log("🔎 Searching User '\(username)': \(query)", type: .traffic)
+        
+        var packet = Data()
+        packet.append(contentsOf: UInt32(0).littleEndianBytes)
+        packet.append(contentsOf: UInt32(42).littleEndianBytes) // User Search
+        packet.append(contentsOf: UInt32(username.count).littleEndianBytes)
+        packet.append(username.data(using: .utf8) ?? Data())
+        packet.append(contentsOf: token.littleEndianBytes)
         packet.append(contentsOf: UInt32(query.count).littleEndianBytes)
         packet.append(query.data(using: .utf8) ?? Data())
         
@@ -319,8 +413,9 @@ class SoulseekClient: ObservableObject {
         log("📡 Reporting Port \(portVal)", type: .info)
         var packet = Data()
         packet.append(contentsOf: UInt32(0).littleEndianBytes)
-        packet.append(contentsOf: UInt32(32).littleEndianBytes)
+        packet.append(contentsOf: UInt32(2).littleEndianBytes) // SetListenPort (correct code)
         packet.append(contentsOf: UInt32(portVal).littleEndianBytes)
+        packet.append(contentsOf: UInt32(portVal + 1).littleEndianBytes) // Obfuscated port
         send(packet: packet)
     }
     
@@ -339,6 +434,97 @@ class SoulseekClient: ObservableObject {
         packet.append(contentsOf: UInt32(0).littleEndianBytes)
         packet.append(contentsOf: UInt32(0).littleEndianBytes)
         send(packet: packet)
+    }
+    
+    // MARK: - Peer Connection Management
+    
+    private func handleConnectToPeer(_ data: Data) {
+        var offset = 4 // Skip message code
+        
+        func readBytes(_ count: Int) -> Data? {
+            guard offset + count <= data.count else { return nil }
+            let d = data.subdata(in: offset..<offset+count)
+            offset += count
+            return d
+        }
+        
+        func readUInt32() -> UInt32? {
+            guard let d = readBytes(4) else { return nil }
+            return d.withUnsafeBytes { $0.load(as: UInt32.self) }
+        }
+        
+        func readString() -> String? {
+            guard let len = readUInt32() else { return nil }
+            guard let d = readBytes(Int(len)) else { return nil }
+            return String(data: d, encoding: .utf8)
+        }
+        
+        guard let username = readString(),
+              let connType = readString(),
+              let ip = readUInt32(),
+              let port = readUInt32(),
+              let token = readUInt32() else {
+            log("⚠️ Failed to parse ConnectToPeer message", type: .error)
+            return
+        }
+        
+        // Convert IP from little-endian integer to dotted notation
+        let ipString = String(format: "%d.%d.%d.%d",
+                             ip & 0xFF,
+                             (ip >> 8) & 0xFF,
+                             (ip >> 16) & 0xFF,
+                             (ip >> 24) & 0xFF)
+        
+        log("🔗 Server requests peer connection to \(username) at \(ipString):\(port) (type: \(connType), token: \(token))", type: .info)
+        
+        // Initiate connection to peer
+        connectToPeer(ip: ipString, port: port, username: username, token: token, connType: connType)
+    }
+    
+    private func connectToPeer(ip: String, port: UInt32, username: String, token: UInt32, connType: String) {
+        let params = NWParameters.tcp
+        let host = NWEndpoint.Host(ip)
+        let portEndpoint = NWEndpoint.Port(rawValue: UInt16(port)) ?? NWEndpoint.Port(integerLiteral: UInt16(port))
+        
+        let peerConnection = NWConnection(host: host, port: portEndpoint, using: params)
+        
+        peerConnection.stateUpdateHandler = { [weak self] state in
+            switch state {
+            case .ready:
+                self?.log("✅ Connected to peer \(username)", type: .success)
+                self?.sendPierceFirewall(connection: peerConnection, token: token)
+                // Start reading from this peer connection
+                self?.readPeerPacket(peerConnection)
+            case .failed(let error):
+                self?.log("❌ Failed to connect to peer \(username): \(error)", type: .error)
+                peerConnection.cancel()
+            case .waiting(let error):
+                self?.log("⏳ Waiting to connect to peer \(username): \(error)", type: .info)
+            default:
+                break
+            }
+        }
+        
+        peerConnection.start(queue: queue)
+    }
+    
+    private func sendPierceFirewall(connection: NWConnection, token: UInt32) {
+        log("🔓 Sending PierceFirewall with token \(token)", type: .traffic)
+        
+        var packet = Data()
+        packet.append(contentsOf: UInt32(0).littleEndianBytes) // Placeholder for length
+        packet.append(contentsOf: UInt32(0).littleEndianBytes) // PierceFirewall code (0)
+        packet.append(contentsOf: token.littleEndianBytes)
+        
+        // Update length
+        let totalLen = UInt32(packet.count - 4)
+        packet.replaceSubrange(0..<4, with: totalLen.littleEndianBytes)
+        
+        connection.send(content: packet, completion: .contentProcessed { error in
+            if let error = error {
+                self.log("⚠️ PierceFirewall send error: \(error)", type: .error)
+            }
+        })
     }
     
     // MARK: - Helpers
@@ -363,6 +549,9 @@ class SoulseekClient: ObservableObject {
     private func handleServerMessage(_ data: Data) {
         guard data.count >= 4 else { return }
         let code = data.prefix(4).withUnsafeBytes { $0.load(as: UInt32.self) }
+        
+        log("📬 Server message code: \(code)", type: .traffic)
+        
         DispatchQueue.main.async {
             switch code {
             case 1: // Login Reply
@@ -377,7 +566,24 @@ class SoulseekClient: ObservableObject {
                     self.loginError = "Login Rejected"
                     self.log("⛔ Login Failed", type: .error)
                 }
-            default: break
+                
+            case 18: // ConnectToPeer
+                self.handleConnectToPeer(data)
+                
+            case 93: // Embedded distributed message
+                self.log("📦 Received embedded message", type: .info)
+                // Extract and handle embedded message
+                if data.count > 5 {
+                    let embeddedData = data.dropFirst(5) // Skip code + 1 byte
+                    if embeddedData.count >= 4 {
+                        let embeddedCode = embeddedData.prefix(4).withUnsafeBytes { $0.load(as: UInt32.self) }
+                        self.log("📦 Embedded message code: \(embeddedCode)", type: .traffic)
+                        // Could be search results or other distributed messages
+                    }
+                }
+                
+            default:
+                break
             }
         }
     }
