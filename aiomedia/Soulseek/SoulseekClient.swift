@@ -12,6 +12,8 @@ enum SoulseekSearchType: String, CaseIterable, Identifiable {
     case similarUsers = "Similar Users (Code 110)"
     case recommendations = "Recommendations (Code 54)"
     case globalRecs = "Global Recs (Code 56)"
+    case relatedSearches = "Related Searches (Code 153)"
+    case serverSearch = "Server-Only Search"
     
     var id: String { rawValue }
 }
@@ -38,6 +40,12 @@ class SoulseekClient: ObservableObject {
     @Published var targetUser: String = ""
     @Published var targetRoom: String = ""
     private var activeSearchTokens: Set<UInt32> = []
+    
+    // Peer connection pooling
+    private var activePeerConnections: [String: NWConnection] = [:]
+    private let maxConcurrentPeerConnections = 5
+    private var pendingPeerRequests: [(ip: String, port: UInt32, username: String, token: UInt32, connType: String)] = []
+    @Published var serverOnlyMode: Bool = false
     
     // Results Stream
     let searchResultsSubject = PassthroughSubject<[SearchResult], Never>()
@@ -98,10 +106,12 @@ class SoulseekClient: ObservableObject {
     }
     
     func disconnect() {
+        disconnectAllPeers()
         connection?.cancel()
         listener?.cancel()
         connection = nil
         listener = nil
+        activeSearchTokens.removeAll()
         DispatchQueue.main.async {
             self.isConnected = false
             self.isLoggedIn = false
@@ -616,11 +626,35 @@ class SoulseekClient: ObservableObject {
         
         log("🔗 Server requests peer connection to \(username) at \(ipString):\(port) (type: \(connType), token: \(token))", type: .info)
         
+        // Check server-only mode
+        if serverOnlyMode {
+            log("📵 Server-only mode: Skipping outbound connection to \(username)", type: .info)
+            sendCannotConnect(token: token, username: username)
+            return
+        }
+        
         // Initiate connection to peer
         connectToPeer(ip: ipString, port: port, username: username, token: token, connType: connType)
     }
     
     private func connectToPeer(ip: String, port: UInt32, username: String, token: UInt32, connType: String) {
+        queue.async { [weak self] in
+            self?.createPeerConnection(ip: ip, port: port, username: username, token: token, connType: connType)
+        }
+    }
+    
+    private func createPeerConnection(ip: String, port: UInt32, username: String, token: UInt32, connType: String) {
+        // Use a unique key to avoid conflicts with multiple connections to same user
+        let connectionKey = "\(username)-\(token)"
+        
+        // Check if we're at max connections (must be called on queue)
+        if activePeerConnections.count >= maxConcurrentPeerConnections {
+            // Queue for later
+            pendingPeerRequests.append((ip, port, username, token, connType))
+            log("📋 Queued connection to \(username) (\(activePeerConnections.count) active)", type: .info)
+            return
+        }
+        
         log("🔗 Attempting peer connection to \(username) at \(ip):\(port) (type: '\(connType)', token: \(token))", type: .info)
         
         let params = NWParameters.tcp
@@ -628,13 +662,16 @@ class SoulseekClient: ObservableObject {
         
         // Set connection timeout
         let tcpOptions = NWProtocolTCP.Options()
-        tcpOptions.connectionTimeout = 30 // 30 seconds timeout
+        tcpOptions.connectionTimeout = 10 // Reduced from 30 seconds to 10 seconds
         params.defaultProtocolStack.transportProtocol = tcpOptions
         
         let host = NWEndpoint.Host(ip)
         let portEndpoint = NWEndpoint.Port(rawValue: UInt16(port)) ?? NWEndpoint.Port(integerLiteral: UInt16(port))
         
         let peerConnection = NWConnection(host: host, port: portEndpoint, using: params)
+        
+        // Track this connection with unique key
+        activePeerConnections[connectionKey] = peerConnection
         
         // Create a timeout timer
         var connectionTimer: DispatchWorkItem? = nil
@@ -646,14 +683,15 @@ class SoulseekClient: ObservableObject {
             case .preparing:
                 self.log("🔄 Preparing connection to \(username)...", type: .info)
                 
-                // Set a timeout for the connection
+                // Set a timeout for the connection (10 seconds)
                 connectionTimer = DispatchWorkItem { [weak self, weak peerConnection] in
                     self?.log("⏱️ Connection timeout for \(username)", type: .error)
                     peerConnection?.cancel()
+                    self?.cleanupPeerConnection(connectionKey)
                     self?.sendCannotConnect(token: token, username: username)
                     self?.requestPeerAddress(username: username)
                 }
-                DispatchQueue.global().asyncAfter(deadline: .now() + 30, execute: connectionTimer!)
+                self.queue.asyncAfter(deadline: .now() + 10, execute: connectionTimer!)
                 
             case .ready:
                 // Cancel the timeout timer
@@ -682,7 +720,7 @@ class SoulseekClient: ObservableObject {
                 connectionTimer?.cancel()
                 connectionTimer = nil
                 self.log("❌ Failed to connect to peer \(username): \(error.localizedDescription)", type: .error)
-                peerConnection.cancel()
+                self.cleanupPeerConnection(connectionKey)
                 // Notify server we couldn't connect
                 self.sendCannotConnect(token: token, username: username)
                 // Try to get peer address from server as fallback
@@ -695,6 +733,7 @@ class SoulseekClient: ObservableObject {
                 connectionTimer?.cancel()
                 connectionTimer = nil
                 self.log("🚫 Connection to \(username) cancelled", type: .info)
+                self.cleanupPeerConnection(connectionKey)
                 
             default:
                 break
@@ -702,6 +741,35 @@ class SoulseekClient: ObservableObject {
         }
         
         peerConnection.start(queue: queue)
+    }
+    
+    private func cleanupPeerConnection(_ connectionKey: String) {
+        queue.async { [weak self] in
+            guard let self = self else { return }
+            
+            if let conn = self.activePeerConnections.removeValue(forKey: connectionKey) {
+                conn.cancel()
+            }
+            
+            // Process next queued request (call synchronous helper directly)
+            if !self.pendingPeerRequests.isEmpty && self.activePeerConnections.count < self.maxConcurrentPeerConnections {
+                let next = self.pendingPeerRequests.removeFirst()
+                self.createPeerConnection(ip: next.ip, port: next.port, username: next.username, token: next.token, connType: next.connType)
+            }
+        }
+    }
+    
+    func disconnectAllPeers() {
+        queue.async { [weak self] in
+            guard let self = self else { return }
+            
+            for (key, conn) in self.activePeerConnections {
+                conn.cancel()
+                self.log("🔌 Disconnected from \(key)", type: .info)
+            }
+            self.activePeerConnections.removeAll()
+            self.pendingPeerRequests.removeAll()
+        }
     }
     
     private func sendPierceFirewall(connection: NWConnection, token: UInt32) {
@@ -832,7 +900,13 @@ class SoulseekClient: ObservableObject {
     
     private func log(_ msg: String, type: LogType) {
         print("[SLSK] \(msg)")
-        DispatchQueue.main.async { self.logs.append(ConsoleLog(message: msg, type: type)) }
+        DispatchQueue.main.async {
+            self.logs.append(ConsoleLog(message: msg, type: type))
+            // Keep only last 500 logs to prevent memory bloat
+            if self.logs.count > 500 {
+                self.logs.removeFirst(self.logs.count - 500)
+            }
+        }
     }
 }
 
