@@ -392,7 +392,7 @@ class SoulseekClient: ObservableObject {
         // Generate unique token
         var token: UInt32
         repeat {
-            token = UInt32.random(in: 1...UInt32.max)
+            token = UInt32.random(in: 1...999_999_999)
         } while activeSearchTokens.contains(token)
         activeSearchTokens.insert(token)
         
@@ -423,7 +423,7 @@ class SoulseekClient: ObservableObject {
     private func performPassiveSearch(query: String, token: UInt32) {
         log("🔎 [PASSIVE] Searching (incoming only): \(query) (token: \(token))", type: .traffic)
         
-        // Same search packet, but we'll skip outbound connections in handleConnectToPeer
+        // Same search packet, but we skip outbound connections in handleConnectToPeer
         var packet = Data()
         packet.append(contentsOf: UInt32(0).littleEndianBytes)
         packet.append(contentsOf: UInt32(26).littleEndianBytes)
