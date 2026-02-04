@@ -44,33 +44,13 @@ struct SearchView: View {
                     
                     // MARK: - Soulseek Search Type Selector
                     if viewModel.selectedService == .soulseek && slskClient.isLoggedIn {
-                        VStack(spacing: 8) {
-                            Picker("Search Type", selection: $slskClient.searchType) {
-                                ForEach(SoulseekSearchType.allCases) { type in
-                                    Text(type.rawValue).tag(type)
-                                }
-                            }
-                            .pickerStyle(.menu)
-                            .padding(.horizontal)
-                            
-                            // Conditional fields for Room and User search
-                            if slskClient.searchType == .room {
-                                TextField("Room name", text: $slskClient.targetRoom)
-                                    .padding(8)
-                                    .background(Color(.systemGray6))
-                                    .cornerRadius(8)
-                                    .padding(.horizontal)
-                            }
-                            
-                            if slskClient.searchType == .user {
-                                TextField("Username", text: $slskClient.targetUser)
-                                    .padding(8)
-                                    .background(Color(.systemGray6))
-                                    .cornerRadius(8)
-                                    .padding(.horizontal)
+                        Picker("Search Type", selection: $slskClient.searchType) {
+                            ForEach(SoulseekSearchType.allCases) { type in
+                                Text(type.rawValue).tag(type)
                             }
                         }
-                        .transition(.opacity)
+                        .pickerStyle(.menu)
+                        .padding(.horizontal)
                     }
                     
                     // MARK: - Info Row (Live Counter + Console Button)

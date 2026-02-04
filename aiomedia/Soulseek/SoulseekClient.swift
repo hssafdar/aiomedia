@@ -30,8 +30,6 @@ class SoulseekClient: ObservableObject {
     
     // Search configuration
     @Published var searchType: SoulseekSearchType = .standard
-    @Published var targetUser: String = ""
-    @Published var targetRoom: String = ""
     private var activeSearchTokens: Set<UInt32> = []
     
     // Peer connection pooling
