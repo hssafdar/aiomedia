@@ -406,6 +406,10 @@ class SoulseekClient: ObservableObject {
             searchRecommendations(query: query, token: token)
         case .globalRecs:
             searchGlobalRecommendations(query: query, token: token)
+        case .relatedSearches:
+            searchRelated(query: query, token: token)
+        case .serverSearch:
+            searchServerOnly(query: query, token: token)
         }
     }
     
@@ -511,6 +515,32 @@ class SoulseekClient: ObservableObject {
         packet.append(query.data(using: .utf8) ?? Data())
         
         send(packet: packet)
+    }
+    
+    /// Related Searches (Code 153)
+    private func searchRelated(query: String, token: UInt32) {
+        log("🔎 [RELATED] Getting related searches: \(query) (token: \(token))", type: .traffic)
+        
+        var packet = Data()
+        packet.append(contentsOf: UInt32(0).littleEndianBytes)
+        packet.append(contentsOf: UInt32(153).littleEndianBytes)  // RelatedSearches
+        packet.append(contentsOf: UInt32(query.count).littleEndianBytes)
+        packet.append(query.data(using: .utf8) ?? Data())
+        send(packet: packet)
+        
+        // Also do a regular search
+        searchNetwork(query: query, token: token)
+    }
+    
+    /// Server-Only Search - skip outbound peer connections
+    private func searchServerOnly(query: String, token: UInt32) {
+        log("🔎 [SERVER-ONLY] Searching (no outbound peers): \(query) (token: \(token))", type: .traffic)
+        
+        // Enable server-only mode
+        serverOnlyMode = true
+        
+        // Do a regular network search - results will come via listener or embedded messages
+        searchNetwork(query: query, token: token)
     }
     
     private func performLogin(user: String, pass: String) {
