@@ -5,15 +5,8 @@ import CryptoKit
 import Compression
 
 enum SoulseekSearchType: String, CaseIterable, Identifiable {
-    case network = "Network (Code 26)"
-    case wishlist = "Wishlist (Code 103)"
-    case room = "Room (Code 120)"
-    case user = "User (Code 42)"
-    case similarUsers = "Similar Users (Code 110)"
-    case recommendations = "Recommendations (Code 54)"
-    case globalRecs = "Global Recs (Code 56)"
-    case relatedSearches = "Related Searches (Code 153)"
-    case serverSearch = "Server-Only Search"
+    case standard = "Standard"      // Normal peer-to-peer search
+    case passive = "Passive"        // Wait for incoming connections only
     
     var id: String { rawValue }
 }
@@ -36,16 +29,13 @@ class SoulseekClient: ObservableObject {
     @Published var logs: [ConsoleLog] = []
     
     // Search configuration
-    @Published var searchType: SoulseekSearchType = .network
-    @Published var targetUser: String = ""
-    @Published var targetRoom: String = ""
+    @Published var searchType: SoulseekSearchType = .standard
     private var activeSearchTokens: Set<UInt32> = []
     
     // Peer connection pooling
     private var activePeerConnections: [String: NWConnection] = [:]
     private let maxConcurrentPeerConnections = 5
     private var pendingPeerRequests: [(ip: String, port: UInt32, username: String, token: UInt32, connType: String)] = []
-    @Published var serverOnlyMode: Bool = false
     
     // Results Stream
     let searchResultsSubject = PassthroughSubject<[SearchResult], Never>()
@@ -121,41 +111,53 @@ class SoulseekClient: ObservableObject {
     // MARK: - 1. P2P Listener & NAT Traversal
     
     private func startListening(completion: @escaping (Bool) -> Void) {
+        let portsToTry: [UInt16] = [2234, 2235, 2236, 2237, 2238, 2239, 2240, 2241, 2242, 2243]
+        
+        tryNextPort(ports: portsToTry, index: 0, completion: completion)
+    }
+    
+    private func tryNextPort(ports: [UInt16], index: Int, completion: @escaping (Bool) -> Void) {
+        guard index < ports.count else {
+            log("❌ All ports failed", type: .error)
+            completion(false)
+            return
+        }
+        
+        let port = NWEndpoint.Port(integerLiteral: ports[index])
+        
         do {
             let params = NWParameters.tcp
             params.allowLocalEndpointReuse = true
-            // This attempts basic NAT-PMP / PCP if the router supports it (Apple's built-in effort)
             params.includePeerToPeer = true
-            
-            // Randomize port slightly to avoid "Address in use" errors on restart
-            let port = NWEndpoint.Port(integerLiteral: UInt16.random(in: 2234...2240))
             
             self.listener = try NWListener(using: params, on: port)
             
-            self.listener?.stateUpdateHandler = { state in
+            self.listener?.stateUpdateHandler = { [weak self] state in
+                guard let self = self else { return }
                 switch state {
                 case .ready:
-                    if let p = self.listener?.port {
-                        self.listeningPort = p
-                        self.log("👂 Listening on Port \(p)", type: .success)
-                        completion(true)
-                    }
+                    self.listeningPort = port
+                    self.log("👂 Listening on Port \(port)", type: .success)
+                    completion(true)
                 case .failed(let error):
-                    self.log("⚠️ Listener Error: \(error)", type: .error)
-                    completion(false)
-                default: break
+                    self.log("⚠️ Port \(port) failed: \(error.localizedDescription)", type: .error)
+                    self.listener?.cancel()
+                    self.tryNextPort(ports: ports, index: index + 1, completion: completion)
+                default:
+                    break
                 }
             }
             
             self.listener?.newConnectionHandler = { [weak self] newConn in
+                self?.log("🔌 Incoming peer connection!", type: .info)
                 self?.handlePeerConnection(newConn)
             }
             
             self.listener?.start(queue: queue)
             
         } catch {
-            log("❌ Listener Init Failed: \(error)", type: .error)
-            completion(false)
+            log("⚠️ Port \(port) init failed: \(error.localizedDescription)", type: .error)
+            tryNextPort(ports: ports, index: index + 1, completion: completion)
         }
     }
     
@@ -382,46 +384,33 @@ class SoulseekClient: ObservableObject {
     // MARK: - 3. Server Protocol
     
     func search(query: String) {
-        guard isLoggedIn else { return }
+        guard isLoggedIn else {
+            log("⚠️ Not logged in, cannot search", type: .error)
+            return
+        }
         
         // Generate unique token
         var token: UInt32
         repeat {
-            token = UInt32.random(in: 1...99999)
+            token = UInt32.random(in: 1...999_999_999)
         } while activeSearchTokens.contains(token)
         activeSearchTokens.insert(token)
         
-        // Reset server-only mode (will be re-enabled if search type is .serverSearch)
-        serverOnlyMode = false
-        
         switch searchType {
-        case .network:
-            searchNetwork(query: query, token: token)
-        case .wishlist:
-            searchWishlist(query: query, token: token)
-        case .room:
-            searchRoom(query: query, room: targetRoom, token: token)
-        case .user:
-            searchUser(query: query, username: targetUser, token: token)
-        case .similarUsers:
-            searchSimilarUsers(query: query, token: token)
-        case .recommendations:
-            searchRecommendations(query: query, token: token)
-        case .globalRecs:
-            searchGlobalRecommendations(query: query, token: token)
-        case .relatedSearches:
-            searchRelated(query: query, token: token)
-        case .serverSearch:
-            searchServerOnly(query: query, token: token)
+        case .standard:
+            performStandardSearch(query: query, token: token)
+        case .passive:
+            performPassiveSearch(query: query, token: token)
         }
     }
     
-    private func searchNetwork(query: String, token: UInt32) {
-        log("🔎 Broadcasting (Network): \(query)", type: .traffic)
+    /// Standard Search - Code 26, accepts peer connections
+    private func performStandardSearch(query: String, token: UInt32) {
+        log("🔎 [STANDARD] Searching: \(query) (token: \(token))", type: .traffic)
         
         var packet = Data()
         packet.append(contentsOf: UInt32(0).littleEndianBytes)
-        packet.append(contentsOf: UInt32(26).littleEndianBytes) // File Search
+        packet.append(contentsOf: UInt32(26).littleEndianBytes)  // FileSearch
         packet.append(contentsOf: token.littleEndianBytes)
         packet.append(contentsOf: UInt32(query.count).littleEndianBytes)
         packet.append(query.data(using: .utf8) ?? Data())
@@ -429,122 +418,20 @@ class SoulseekClient: ObservableObject {
         send(packet: packet)
     }
     
-    private func searchWishlist(query: String, token: UInt32) {
-        log("🔎 Adding Wishlist Search: \(query)", type: .traffic)
+    /// Passive Search - Code 26 but don't initiate outbound connections
+    /// Only receive results from peers who connect TO us
+    private func performPassiveSearch(query: String, token: UInt32) {
+        log("🔎 [PASSIVE] Searching (incoming only): \(query) (token: \(token))", type: .traffic)
         
-        // Note: Wishlist searches don't use tokens in the protocol packet,
-        // but we track the token for consistency
+        // Same search packet, but we skip outbound connections in handleConnectToPeer
         var packet = Data()
         packet.append(contentsOf: UInt32(0).littleEndianBytes)
-        packet.append(contentsOf: UInt32(103).littleEndianBytes) // Add Wishlist Item
-        packet.append(contentsOf: UInt32(query.count).littleEndianBytes)
-        packet.append(query.data(using: .utf8) ?? Data())
-        
-        send(packet: packet)
-    }
-    
-    private func searchRoom(query: String, room: String, token: UInt32) {
-        guard !room.isEmpty else {
-            log("⚠️ Room search requires a room name", type: .error)
-            return
-        }
-        log("🔎 Searching Room '\(room)': \(query)", type: .traffic)
-        
-        var packet = Data()
-        packet.append(contentsOf: UInt32(0).littleEndianBytes)
-        packet.append(contentsOf: UInt32(120).littleEndianBytes) // Room Search
-        packet.append(contentsOf: UInt32(room.count).littleEndianBytes)
-        packet.append(room.data(using: .utf8) ?? Data())
+        packet.append(contentsOf: UInt32(26).littleEndianBytes)
         packet.append(contentsOf: token.littleEndianBytes)
         packet.append(contentsOf: UInt32(query.count).littleEndianBytes)
         packet.append(query.data(using: .utf8) ?? Data())
         
         send(packet: packet)
-    }
-    
-    private func searchUser(query: String, username: String, token: UInt32) {
-        guard !username.isEmpty else {
-            log("⚠️ User search requires a username", type: .error)
-            return
-        }
-        log("🔎 Searching User '\(username)': \(query)", type: .traffic)
-        
-        var packet = Data()
-        packet.append(contentsOf: UInt32(0).littleEndianBytes)
-        packet.append(contentsOf: UInt32(42).littleEndianBytes) // User Search
-        packet.append(contentsOf: UInt32(username.count).littleEndianBytes)
-        packet.append(username.data(using: .utf8) ?? Data())
-        packet.append(contentsOf: token.littleEndianBytes)
-        packet.append(contentsOf: UInt32(query.count).littleEndianBytes)
-        packet.append(query.data(using: .utf8) ?? Data())
-        
-        send(packet: packet)
-    }
-    
-    private func searchSimilarUsers(query: String, token: UInt32) {
-        log("🔎 Searching Similar Users: \(query)", type: .traffic)
-        
-        var packet = Data()
-        packet.append(contentsOf: UInt32(0).littleEndianBytes)
-        packet.append(contentsOf: UInt32(110).littleEndianBytes) // Similar Users Search
-        packet.append(contentsOf: token.littleEndianBytes)
-        packet.append(contentsOf: UInt32(query.count).littleEndianBytes)
-        packet.append(query.data(using: .utf8) ?? Data())
-        
-        send(packet: packet)
-    }
-    
-    private func searchRecommendations(query: String, token: UInt32) {
-        log("🔎 Searching Recommendations: \(query)", type: .traffic)
-        
-        var packet = Data()
-        packet.append(contentsOf: UInt32(0).littleEndianBytes)
-        packet.append(contentsOf: UInt32(54).littleEndianBytes) // Recommendations
-        packet.append(contentsOf: token.littleEndianBytes)
-        packet.append(contentsOf: UInt32(query.count).littleEndianBytes)
-        packet.append(query.data(using: .utf8) ?? Data())
-        
-        send(packet: packet)
-    }
-    
-    private func searchGlobalRecommendations(query: String, token: UInt32) {
-        log("🔎 Searching Global Recommendations: \(query)", type: .traffic)
-        
-        var packet = Data()
-        packet.append(contentsOf: UInt32(0).littleEndianBytes)
-        packet.append(contentsOf: UInt32(56).littleEndianBytes) // Global Recommendations
-        packet.append(contentsOf: token.littleEndianBytes)
-        packet.append(contentsOf: UInt32(query.count).littleEndianBytes)
-        packet.append(query.data(using: .utf8) ?? Data())
-        
-        send(packet: packet)
-    }
-    
-    /// Related Searches (Code 153)
-    private func searchRelated(query: String, token: UInt32) {
-        log("🔎 [RELATED] Getting related searches: \(query) (token: \(token))", type: .traffic)
-        
-        var packet = Data()
-        packet.append(contentsOf: UInt32(0).littleEndianBytes)
-        packet.append(contentsOf: UInt32(153).littleEndianBytes)  // RelatedSearches
-        packet.append(contentsOf: token.littleEndianBytes)
-        packet.append(contentsOf: UInt32(query.count).littleEndianBytes)
-        packet.append(query.data(using: .utf8) ?? Data())
-        send(packet: packet)
-        
-        // Also do a regular search
-        searchNetwork(query: query, token: token)
-    }
-    
-    /// Server-Only Search - skip outbound peer connections
-    private func searchServerOnly(query: String, token: UInt32) {
-        log("🔎 [SERVER-ONLY] Searching (no outbound peers): \(query) (token: \(token))", type: .traffic)
-        
-        // Enable server-only mode
-        serverOnlyMode = true
-        
-        // Do a regular network search - results will come via listener or embedded messages
-        searchNetwork(query: query, token: token)
     }
     
     private func performLogin(user: String, pass: String) {
@@ -660,9 +547,9 @@ class SoulseekClient: ObservableObject {
         
         log("🔗 Server requests peer connection to \(username) at \(ipString):\(port) (type: \(connType), token: \(token))", type: .info)
         
-        // Check server-only mode
-        if serverOnlyMode {
-            log("📵 Server-only mode: Skipping outbound connection to \(username)", type: .info)
+        // Only skip outbound if user explicitly chose passive mode
+        if searchType == .passive {
+            log("📵 Passive mode: Skipping outbound to \(username)", type: .info)
             sendCannotConnect(token: token, username: username)
             return
         }
