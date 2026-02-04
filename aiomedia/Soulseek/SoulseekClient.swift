@@ -638,121 +638,136 @@ class SoulseekClient: ObservableObject {
     }
     
     private func connectToPeer(ip: String, port: UInt32, username: String, token: UInt32, connType: String) {
-        // Check if we're at max connections
-        if activePeerConnections.count >= maxConcurrentPeerConnections {
-            // Queue for later
-            pendingPeerRequests.append((ip, port, username, token, connType))
-            log("📋 Queued connection to \(username) (\(activePeerConnections.count) active)", type: .info)
-            return
-        }
+        // Use a unique key to avoid conflicts with multiple connections to same user
+        let connectionKey = "\(username)-\(token)"
         
-        log("🔗 Attempting peer connection to \(username) at \(ip):\(port) (type: '\(connType)', token: \(token))", type: .info)
-        
-        let params = NWParameters.tcp
-        params.includePeerToPeer = true
-        
-        // Set connection timeout
-        let tcpOptions = NWProtocolTCP.Options()
-        tcpOptions.connectionTimeout = 10 // Reduced from 30 to 10 seconds
-        params.defaultProtocolStack.transportProtocol = tcpOptions
-        
-        let host = NWEndpoint.Host(ip)
-        let portEndpoint = NWEndpoint.Port(rawValue: UInt16(port)) ?? NWEndpoint.Port(integerLiteral: UInt16(port))
-        
-        let peerConnection = NWConnection(host: host, port: portEndpoint, using: params)
-        
-        // Track this connection
-        activePeerConnections[username] = peerConnection
-        
-        // Create a timeout timer
-        var connectionTimer: DispatchWorkItem? = nil
-        
-        peerConnection.stateUpdateHandler = { [weak self] state in
+        // Check if we're at max connections (thread-safe check)
+        queue.async { [weak self] in
             guard let self = self else { return }
             
-            switch state {
-            case .preparing:
-                self.log("🔄 Preparing connection to \(username)...", type: .info)
-                
-                // Set a timeout for the connection (10 seconds)
-                connectionTimer = DispatchWorkItem { [weak self, weak peerConnection] in
-                    self?.log("⏱️ Connection timeout for \(username)", type: .error)
-                    peerConnection?.cancel()
-                    self?.cleanupPeerConnection(username)
-                    self?.sendCannotConnect(token: token, username: username)
-                    self?.requestPeerAddress(username: username)
-                }
-                DispatchQueue.global().asyncAfter(deadline: .now() + 10, execute: connectionTimer!)
-                
-            case .ready:
-                // Cancel the timeout timer
-                connectionTimer?.cancel()
-                connectionTimer = nil
-                
-                self.log("✅ Connected to peer \(username) - sending init for type '\(connType)'", type: .success)
-                
-                // Determine which initialization message to send based on connection type
-                // Connection type 'P' (0x50 / 80 decimal) requires PeerInit
-                // Connection type 'F' (0x46 / 70 decimal) requires PierceFirewall
-                // Connection type 'D' (0x44 / 68 decimal) is for distributed network
-                
-                if connType == "P" {
-                    // Send PeerInit for type 'P' connections
-                    self.sendPeerInit(connection: peerConnection, username: username, connType: connType, token: token)
-                } else {
-                    // Send PierceFirewall for other types (F, D)
-                    self.sendPierceFirewall(connection: peerConnection, token: token)
-                }
-                
-                // Start reading from this peer connection
-                self.readPeerPacket(peerConnection)
-                
-            case .failed(let error):
-                connectionTimer?.cancel()
-                connectionTimer = nil
-                self.log("❌ Failed to connect to peer \(username): \(error.localizedDescription)", type: .error)
-                self.cleanupPeerConnection(username)
-                // Notify server we couldn't connect
-                self.sendCannotConnect(token: token, username: username)
-                // Try to get peer address from server as fallback
-                self.requestPeerAddress(username: username)
-                
-            case .waiting(let error):
-                self.log("⏳ Waiting to connect to peer \(username): \(error.localizedDescription)", type: .info)
-                
-            case .cancelled:
-                connectionTimer?.cancel()
-                connectionTimer = nil
-                self.log("🚫 Connection to \(username) cancelled", type: .info)
-                self.cleanupPeerConnection(username)
-                
-            default:
-                break
+            if self.activePeerConnections.count >= self.maxConcurrentPeerConnections {
+                // Queue for later
+                self.pendingPeerRequests.append((ip, port, username, token, connType))
+                self.log("📋 Queued connection to \(username) (\(self.activePeerConnections.count) active)", type: .info)
+                return
             }
+            
+            self.log("🔗 Attempting peer connection to \(username) at \(ip):\(port) (type: '\(connType)', token: \(token))", type: .info)
+            
+            let params = NWParameters.tcp
+            params.includePeerToPeer = true
+            
+            // Set connection timeout
+            let tcpOptions = NWProtocolTCP.Options()
+            tcpOptions.connectionTimeout = 10 // Reduced from 30 to 10 seconds
+            params.defaultProtocolStack.transportProtocol = tcpOptions
+            
+            let host = NWEndpoint.Host(ip)
+            let portEndpoint = NWEndpoint.Port(rawValue: UInt16(port)) ?? NWEndpoint.Port(integerLiteral: UInt16(port))
+            
+            let peerConnection = NWConnection(host: host, port: portEndpoint, using: params)
+            
+            // Track this connection with unique key
+            self.activePeerConnections[connectionKey] = peerConnection
+            
+            // Create a timeout timer
+            var connectionTimer: DispatchWorkItem? = nil
+            
+            peerConnection.stateUpdateHandler = { [weak self] state in
+                guard let self = self else { return }
+                
+                switch state {
+                case .preparing:
+                    self.log("🔄 Preparing connection to \(username)...", type: .info)
+                    
+                    // Set a timeout for the connection (10 seconds)
+                    connectionTimer = DispatchWorkItem { [weak self, weak peerConnection] in
+                        self?.log("⏱️ Connection timeout for \(username)", type: .error)
+                        peerConnection?.cancel()
+                        self?.cleanupPeerConnection(connectionKey)
+                        self?.sendCannotConnect(token: token, username: username)
+                        self?.requestPeerAddress(username: username)
+                    }
+                    DispatchQueue.global().asyncAfter(deadline: .now() + 10, execute: connectionTimer!)
+                    
+                case .ready:
+                    // Cancel the timeout timer
+                    connectionTimer?.cancel()
+                    connectionTimer = nil
+                    
+                    self.log("✅ Connected to peer \(username) - sending init for type '\(connType)'", type: .success)
+                    
+                    // Determine which initialization message to send based on connection type
+                    // Connection type 'P' (0x50 / 80 decimal) requires PeerInit
+                    // Connection type 'F' (0x46 / 70 decimal) requires PierceFirewall
+                    // Connection type 'D' (0x44 / 68 decimal) is for distributed network
+                    
+                    if connType == "P" {
+                        // Send PeerInit for type 'P' connections
+                        self.sendPeerInit(connection: peerConnection, username: username, connType: connType, token: token)
+                    } else {
+                        // Send PierceFirewall for other types (F, D)
+                        self.sendPierceFirewall(connection: peerConnection, token: token)
+                    }
+                    
+                    // Start reading from this peer connection
+                    self.readPeerPacket(peerConnection)
+                    
+                case .failed(let error):
+                    connectionTimer?.cancel()
+                    connectionTimer = nil
+                    self.log("❌ Failed to connect to peer \(username): \(error.localizedDescription)", type: .error)
+                    self.cleanupPeerConnection(connectionKey)
+                    // Notify server we couldn't connect
+                    self.sendCannotConnect(token: token, username: username)
+                    // Try to get peer address from server as fallback
+                    self.requestPeerAddress(username: username)
+                    
+                case .waiting(let error):
+                    self.log("⏳ Waiting to connect to peer \(username): \(error.localizedDescription)", type: .info)
+                    
+                case .cancelled:
+                    connectionTimer?.cancel()
+                    connectionTimer = nil
+                    self.log("🚫 Connection to \(username) cancelled", type: .info)
+                    self.cleanupPeerConnection(connectionKey)
+                    
+                default:
+                    break
+                }
+            }
+            
+            peerConnection.start(queue: self.queue)
         }
-        
-        peerConnection.start(queue: queue)
     }
     
-    private func cleanupPeerConnection(_ username: String) {
-        if let conn = activePeerConnections.removeValue(forKey: username) {
-            conn.cancel()
-        }
-        
-        // Process next queued request
-        if !pendingPeerRequests.isEmpty && activePeerConnections.count < maxConcurrentPeerConnections {
-            let next = pendingPeerRequests.removeFirst()
-            connectToPeer(ip: next.ip, port: next.port, username: next.username, token: next.token, connType: next.connType)
+    private func cleanupPeerConnection(_ connectionKey: String) {
+        queue.async { [weak self] in
+            guard let self = self else { return }
+            
+            if let conn = self.activePeerConnections.removeValue(forKey: connectionKey) {
+                conn.cancel()
+            }
+            
+            // Process next queued request
+            if !self.pendingPeerRequests.isEmpty && self.activePeerConnections.count < self.maxConcurrentPeerConnections {
+                let next = self.pendingPeerRequests.removeFirst()
+                self.connectToPeer(ip: next.ip, port: next.port, username: next.username, token: next.token, connType: next.connType)
+            }
         }
     }
     
     func disconnectAllPeers() {
-        for (username, conn) in activePeerConnections {
-            conn.cancel()
-            log("🔌 Disconnected from \(username)", type: .info)
+        queue.async { [weak self] in
+            guard let self = self else { return }
+            
+            for (username, conn) in self.activePeerConnections {
+                conn.cancel()
+                self.log("🔌 Disconnected from \(username)", type: .info)
+            }
+            self.activePeerConnections.removeAll()
+            self.pendingPeerRequests.removeAll()
         }
-        activePeerConnections.removeAll()
-        pendingPeerRequests.removeAll()
     }
     
     private func sendPierceFirewall(connection: NWConnection, token: UInt32) {
