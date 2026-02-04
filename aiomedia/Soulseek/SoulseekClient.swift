@@ -391,6 +391,9 @@ class SoulseekClient: ObservableObject {
         } while activeSearchTokens.contains(token)
         activeSearchTokens.insert(token)
         
+        // Reset server-only mode (will be re-enabled if search type is .serverSearch)
+        serverOnlyMode = false
+        
         switch searchType {
         case .network:
             searchNetwork(query: query, token: token)
@@ -524,6 +527,7 @@ class SoulseekClient: ObservableObject {
         var packet = Data()
         packet.append(contentsOf: UInt32(0).littleEndianBytes)
         packet.append(contentsOf: UInt32(153).littleEndianBytes)  // RelatedSearches
+        packet.append(contentsOf: token.littleEndianBytes)
         packet.append(contentsOf: UInt32(query.count).littleEndianBytes)
         packet.append(query.data(using: .utf8) ?? Data())
         send(packet: packet)
