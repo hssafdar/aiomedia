@@ -18,6 +18,11 @@ struct ContentView: View {
                     Label("Favorites", systemImage: "star.fill")
                 }
             
+            VocalRemoverView()
+                .tabItem {
+                    Label("Vocal Remover", systemImage: "waveform.slash")
+                }
+
             SettingsView()
                 .tabItem {
                     Label("Settings", systemImage: "gear")
