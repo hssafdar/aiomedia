@@ -1,0 +1,13 @@
+# Xcode
+*.xcuserstate
+xcuserdata/
+DerivedData/
+
+# Swift Package Manager build artifacts
+.build/
+
+# macOS
+.DS_Store
+
+# CocoaPods
+Pods/
